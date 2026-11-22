@@ -379,9 +379,17 @@ function renderNodes(nodes, scope, ctx, depth, out) {
       case 'for': {
         const xs = lookup(scope, node.path);
         if (!Array.isArray(xs)) break;
+        // One scope object reused across iterations: rendering is
+        // synchronous, so mutating it per iteration is invisible.
+        const vars = { [node.name]: undefined, loop: { index: 0, first: false, last: false, length: xs.length } };
+        const child = { vars, parent: scope };
         for (let k = 0; k < xs.length; k++) {
-          const vars = { [node.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === xs.length - 1, length: xs.length } };
-          renderNodes(node.body, { vars, parent: scope }, ctx, depth, out);
+          vars[node.name] = xs[k];
+          const lp = vars.loop;
+          lp.index = k + 1;
+          lp.first = k === 0;
+          lp.last = k === xs.length - 1;
+          renderNodes(node.body, child, ctx, depth, out);
         }
         break;
       }
@@ -485,26 +493,32 @@ function findSingleStar(s, from, hi) {
   return -1;
 }
 
-/** `s[lo..hi]` rendered inline into `out`; `env.link(target)` is a link's href. */
+/** `s[lo..hi]` rendered inline into `out`; `env.link(target)` is a link's href.
+ * Plain runs are flushed as single slices; only markup boundaries push. */
 function inlineRange(s, lo, hi, env, out) {
   let i = lo;
+  let start = lo;
+  const flush = (to) => { if (to > start) out.push(s.slice(start, to)); };
   while (i < hi) {
     const c = s[i];
     if (c === '\\' && i + 1 < hi && ESCAPABLE.has(s[i + 1])) {
+      flush(i);
       const n = s[i + 1];
       out.push(n === '&' ? '&amp;' : n === '<' ? '&lt;' : n === '>' ? '&gt;' : n === '"' ? '&quot;' : n === "'" ? '&#39;' : n);
       i += 2;
+      start = i;
       continue;
     }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
       if (j !== -1 && j < hi && j > i + 1) {
+        flush(i);
         out.push('<code>');
         escapeRange(s, i + 1, j, out);
         out.push('</code>');
         i = j + 1;
+        start = i;
       } else {
-        out.push('`');
         i++;
       }
       continue;
@@ -513,24 +527,26 @@ function inlineRange(s, lo, hi, env, out) {
       if (i + 1 < hi && s[i + 1] === '*') {
         const j = findUnescaped(s, '**', i + 2, hi);
         if (j !== -1 && j > i + 2) {
+          flush(i);
           out.push('<strong>');
           inlineRange(s, i + 2, j, env, out);
           out.push('</strong>');
           i = j + 2;
+          start = i;
         } else {
-          out.push('**');
           i += 2;
         }
         continue;
       }
       const j = findSingleStar(s, i + 1, hi);
       if (j !== -1 && j > i + 1) {
+        flush(i);
         out.push('<em>');
         inlineRange(s, i + 1, j, env, out);
         out.push('</em>');
         i = j + 1;
+        start = i;
       } else {
-        out.push('*');
         i++;
       }
       continue;
@@ -540,6 +556,7 @@ function inlineRange(s, lo, hi, env, out) {
       const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = m !== -1 && m < hi ? s.slice(k + 2, m) : '';
       if (m !== -1 && m < hi && target !== '' && !WS_RE.test(target)) {
+        flush(i);
         const href = env.link(target);
         out.push('<a href="');
         escapeRange(href, 0, href.length, out);
@@ -547,21 +564,23 @@ function inlineRange(s, lo, hi, env, out) {
         inlineRange(s, i + 1, k, env, out);
         out.push('</a>');
         i = m + 1;
+        start = i;
         continue;
       }
-      out.push('[');
       i++;
       continue;
     }
     const code = s.charCodeAt(i);
-    if (code === 38) out.push('&amp;');
-    else if (code === 60) out.push('&lt;');
-    else if (code === 62) out.push('&gt;');
-    else if (code === 34) out.push('&quot;');
-    else if (code === 39) out.push('&#39;');
-    else out.push(c);
+    if (code === 38 || code === 60 || code === 62 || code === 34 || code === 39) {
+      flush(i);
+      out.push(code === 38 ? '&amp;' : code === 60 ? '&lt;' : code === 62 ? '&gt;' : code === 34 ? '&quot;' : '&#39;');
+      i++;
+      start = i;
+      continue;
+    }
     i++;
   }
+  flush(hi);
 }
 
 /**
@@ -688,7 +707,11 @@ function wordsOf(text) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWSCode(text.charCodeAt(i))) inWord = false;
+    const c = text.charCodeAt(i);
+    const ws = (c >= 9 && c <= 13) || c === 32 || c === 0xa0 || c === 0x1680 ||
+      (c >= 0x2000 && c <= 0x200a) || c === 0x2028 || c === 0x2029 ||
+      c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
+    if (ws) inWord = false;
     else if (!inWord) { inWord = true; count++; }
   }
   return count;
@@ -866,11 +889,15 @@ export function run(input) {
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const ctx = { templates };
+  // The top scope is two levels: the call's own vars over the shared
+  // site/tags/recent scope — the same lookups as one merged object, since
+  // the call's keys (page, posts, pager, tag) never collide with them.
+  const topScope = { vars: { site, tags: allTags, recent }, parent: null };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    renderNodes(nodes, { vars, parent: topScope }, ctx, 0, out);
     return out.join('');
   };
   for (const s of sources) {

@@ -738,11 +738,6 @@ function continuedRange(s, a, b) {
   return k >= 2 && a + k < b && !isWSCode(s.charCodeAt(a + k));
 }
 
-/** Whether s[a..b] ends a paragraph. */
-function endsParagraphRange(s, a, b) {
-  return isBlankLineRange(s, a, b) || fenceOpenRange(s, a, b) !== null || headingRange(s, a, b) !== null || hrRange(s, a, b);
-}
-
 // The characters a backslash escapes, as a table indexed by code unit.
 const ESCAPABLE_TAB = new Uint8Array(128);
 for (const ch of '\\`*_[]()#+-.!>') ESCAPABLE_TAB[ch.charCodeAt(0)] = 1;
@@ -890,16 +885,19 @@ function inlineRange(s, lo, hi, env, out) {
  * over the body's own range when no line needed trimming (the lines are
  * contiguous, joined by single newlines), else over the joined string.
  */
+/** `parts` is a flat array of [start, end] pairs; render them as inline. */
 function inlineParts(src, parts, needsTrim, env, out) {
-  if (parts.length === 1) {
-    inlineRange(src, parts[0][0], parts[0][1], env, out);
+  if (parts.length === 2) {
+    inlineRange(src, parts[0], parts[1], env, out);
     return;
   }
   if (!needsTrim) {
-    inlineRange(src, parts[0][0], parts[parts.length - 1][1], env, out);
+    inlineRange(src, parts[0], parts[parts.length - 1], env, out);
     return;
   }
-  const joined = parts.map(([a, b]) => src.slice(a, b)).join('\n');
+  const pieces = [];
+  for (let k = 0; k < parts.length; k += 2) pieces.push(src.slice(parts[k], parts[k + 1]));
+  const joined = pieces.join('\n');
   inlineRange(joined, 0, joined.length, env, out);
 }
 
@@ -922,6 +920,9 @@ function renderMarkdown(src, env, cache) {
     if (c === 10) {
       starts[lines++] = i + 1;
       inWord = false;
+    } else if (((c - 33) >>> 0) < 94) {
+      // ASCII printable (33..126): never whitespace, so a word character.
+      if (!inWord) { inWord = true; words++; }
     } else if (WS_TAB[c]) inWord = false;
     else if (!inWord) {
       inWord = true;
@@ -938,8 +939,11 @@ function renderMarkdown(src, env, cache) {
   while (i < L) {
     const a = starts[i];
     const b = endOf(i);
-    if (isBlankLineRange(src, a, b)) { i++; continue; }
-    const lang = fenceOpenRange(src, a, b);
+    // Every block-start marker must sit at the line's first character, so
+    // one look at it decides which helper can possibly match.
+    const c0 = a < b ? src.charCodeAt(a) : 32;
+    if ((c0 === 32 || c0 === 9) && isBlankLineRange(src, a, b)) { i++; continue; }
+    const lang = c0 === 96 ? fenceOpenRange(src, a, b) : null;
     if (lang !== null) {
       i++;
       out.push('<pre><code');
@@ -952,7 +956,7 @@ function renderMarkdown(src, env, cache) {
       while (i < L) {
         const fa = starts[i];
         const fb = endOf(i);
-        if (fenceCloseRange(src, fa, fb)) break;
+        if (fa < fb && src.charCodeAt(fa) === 96 && fenceCloseRange(src, fa, fb)) break;
         escapeRange(src, fa, fb, out);
         out.push('\n');
         i++;
@@ -961,7 +965,7 @@ function renderMarkdown(src, env, cache) {
       out.push('</code></pre>', '\n');
       continue;
     }
-    const heading = headingRange(src, a, b);
+    const heading = c0 === 35 ? headingRange(src, a, b) : null;
     if (heading !== null) {
       const id = uniqueSlug(slugify(src.slice(heading.s, heading.e), cache), ids);
       const inner = [];
@@ -972,8 +976,8 @@ function renderMarkdown(src, env, cache) {
       i++;
       continue;
     }
-    if (hrRange(src, a, b)) { out.push('<hr>', '\n'); i++; continue; }
-    if (src.charCodeAt(a) === 62) {
+    if ((c0 === 45 || c0 === 42) && hrRange(src, a, b)) { out.push('<hr>', '\n'); i++; continue; }
+    if (c0 === 62) {
       const kept = [];
       while (i < L) {
         const qa = starts[i];
@@ -983,47 +987,54 @@ function renderMarkdown(src, env, cache) {
         if (s2 < qb && src.charCodeAt(s2) === 32) s2++;
         s2 = trimStartRange(src, s2, qb);
         const e2 = trimEndRange(src, s2, qb);
-        if (e2 > s2) kept.push([s2, e2]);
+        if (e2 > s2) kept.push(s2, e2);
         i++;
       }
       if (kept.length === 0) out.push('<blockquote>\n</blockquote>', '\n');
       else {
         out.push('<blockquote>\n<p>');
-        if (kept.length === 1) inlineRange(src, kept[0][0], kept[0][1], env, out);
+        if (kept.length === 2) inlineRange(src, kept[0], kept[1], env, out);
         else {
-          const joined = kept.map(([s, e]) => src.slice(s, e)).join('\n');
+          const pieces = [];
+          for (let k = 0; k < kept.length; k += 2) pieces.push(src.slice(kept[k], kept[k + 1]));
+          const joined = pieces.join('\n');
           inlineRange(joined, 0, joined.length, env, out);
         }
         out.push('</p>\n</blockquote>', '\n');
       }
       continue;
     }
-    const marker = listMarkerRange(src, a, b);
+    const marker = (c0 === 45 || c0 === 42 || (c0 >= 48 && c0 <= 57)) ? listMarkerRange(src, a, b) : null;
     if (marker !== null) {
       const ordered = marker.ordered;
       const start = marker.start;
-      const items = [[[marker.s, marker.e]]];
+      const items = [[marker.s, marker.e]];
       i++;
       while (i < L) {
         const la = starts[i];
         const lb = endOf(i);
-        const m2 = listMarkerRange(src, la, lb);
-        if (m2 !== null && m2.ordered === ordered) {
-          items.push([[m2.s, m2.e]]);
-          i++;
-        } else if (continuedRange(src, la, lb)) {
+        const lc = la < lb ? src.charCodeAt(la) : 32;
+        if (lc === 32) {
+          if (!continuedRange(src, la, lb)) break;
           const ta = trimStartRange(src, la, lb);
           const tb = trimEndRange(src, ta, lb);
-          items[items.length - 1].push([ta, tb]);
+          items[items.length - 1].push(ta, tb);
+          i++;
+        } else if (lc === 45 || lc === 42 || (lc >= 48 && lc <= 57)) {
+          const m2 = listMarkerRange(src, la, lb);
+          if (m2 === null || m2.ordered !== ordered) break;
+          items.push([m2.s, m2.e]);
           i++;
         } else break;
       }
       out.push(ordered && start !== 1 ? `<ol start="${start}">` : `<${ordered ? 'ol' : 'ul'}>`, '\n');
       for (const parts of items) {
         out.push('<li>');
-        if (parts.length === 1) inlineRange(src, parts[0][0], parts[0][1], env, out);
+        if (parts.length === 2) inlineRange(src, parts[0], parts[1], env, out);
         else {
-          const joined = parts.map(([s, e]) => src.slice(s, e)).join('\n');
+          const pieces = [];
+          for (let k = 0; k < parts.length; k += 2) pieces.push(src.slice(parts[k], parts[k + 1]));
+          const joined = pieces.join('\n');
           inlineRange(joined, 0, joined.length, env, out);
         }
         out.push('</li>\n');
@@ -1034,20 +1045,33 @@ function renderMarkdown(src, env, cache) {
     const parts = [];
     let needsTrim = false;
     {
-      const ta = trimStartRange(src, a, b);
-      const tb = trimEndRange(src, ta, b);
+      // Most lines need no trimming: skip the helper calls when the first
+      // and last characters already prove it.
+      const ta = (c0 === 32 || c0 === 9) ? trimStartRange(src, a, b) : a;
+      const tb = (b > ta && (src.charCodeAt(b - 1) === 32 || src.charCodeAt(b - 1) === 9)) ? trimEndRange(src, ta, b) : b;
       if (ta !== a || tb !== b) needsTrim = true;
-      parts.push([ta, tb]);
+      parts.push(ta, tb);
     }
     i++;
     while (i < L) {
       const pa = starts[i];
       const pb = endOf(i);
-      if (endsParagraphRange(src, pa, pb)) break;
-      const ta = trimStartRange(src, pa, pb);
-      const tb = trimEndRange(src, ta, pb);
+      // A paragraph ends only on blank, fence, heading or hr; each of
+      // those must start at the line's first character.
+      const pc = pa < pb ? src.charCodeAt(pa) : 32;
+      if (pc === 32 || pc === 9) {
+        if (isBlankLineRange(src, pa, pb)) break;
+      } else if (pc === 96) {
+        if (fenceOpenRange(src, pa, pb) !== null) break;
+      } else if (pc === 35) {
+        if (headingRange(src, pa, pb) !== null) break;
+      } else if (pc === 45 || pc === 42) {
+        if (hrRange(src, pa, pb)) break;
+      }
+      const ta = (pc === 32 || pc === 9) ? trimStartRange(src, pa, pb) : pa;
+      const tb = (pb > ta && (src.charCodeAt(pb - 1) === 32 || src.charCodeAt(pb - 1) === 9)) ? trimEndRange(src, ta, pb) : pb;
       if (ta !== pa || tb !== pb) needsTrim = true;
-      parts.push([ta, tb]);
+      parts.push(ta, tb);
       i++;
     }
     if (excerpt === null) {
@@ -1085,10 +1109,10 @@ export function run(input) {
       report.push(err.message);
     }
   }
-  for (const t of templates.values()) {
+  for (const [name, t] of templates) {
     // Analysis needs the whole parsed map (includes reach across it).
     // It also flags each loop that may be cached per array.
-    const info = analyzeTemplateFor(t, templates);
+    const info = analyzeTemplate(name, templates);
     t.topOnly = info.topOnly;
     t.need = info.need;
     t.external = info.external;
@@ -1319,16 +1343,4 @@ export function run(input) {
   lines.push(`built ${pageCount} pages, ${posts.length} posts, ${tags.length} tags and ${statics.length} static files`);
   output['build-report.txt'] = `${lines.join('\n')}\n`;
   return output;
-}
-
-/** Analyse one parsed template record against the whole parsed map. */
-function analyzeTemplateFor(t, templates) {
-  // Recover this record's name from the map (each record is stored once).
-  for (const [name, rec] of templates) {
-    if (rec === t) {
-      const r = walkNodes(rec.nodes, new Map(), new Set([name]), templates);
-      return { topOnly: r.ok && !r.cycle, need: r.cycle ? Infinity : r.need, external: r.external };
-    }
-  }
-  return { topOnly: false, need: Infinity, external: new Set() };
 }
